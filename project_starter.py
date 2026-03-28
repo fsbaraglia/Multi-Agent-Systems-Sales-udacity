@@ -655,7 +655,8 @@ def find_matching_item_by_name(requested_name: str) -> str:
         return substring_match
 
     # 4. Word-overlap scoring (keep product codes like "a4", "a3")
-    stop_words = {"the", "a", "an", "of", "for", "and", "or", "with", "in", "on"}
+    # "paper" is excluded because it appears in almost every item name and produces false matches
+    stop_words = {"the", "a", "an", "of", "for", "and", "or", "with", "in", "on", "paper", "papers"}
     req_words = {w for w in req.split() if w not in stop_words}
     if not req_words:
         return None
@@ -671,53 +672,61 @@ def find_matching_item_by_name(requested_name: str) -> str:
 
 # Tools for inventory agent
 
-INVENTORY_INSTRUCTIONS = """\
-You are a specialized agent for managing inventory.
-Your goal is to proactively maintain healthy stock levels and fulfill inventory-related tasks accurately by following a strick workflow and rules.
+INVENTORY_SYSTEM_PROMPT = """\
+You are the Inventory Agent for Munder Difflin, a paper supply company.
+Your goal is to accurately report stock levels and place stock orders when instructed.
+
+**Always pass the `as_of_date` provided in the task to every tool call.**
 
 ## Available Tools
 - `get_full_inventory_report(as_of_date)` — returns all items with current stock and minimum stock levels
 - `check_stock_levels(item_name, as_of_date)` — returns current stock for a single item
 - `check_reorder_status(item_name, as_of_date)` — returns whether an item is below its minimum stock threshold
+- `check_delivery_timeline(item_name, quantity, order_date)` — returns the estimated supplier delivery date
 - `get_company_financials(as_of_date)` — returns unit prices for all items
 - `check_cash_balance(as_of_date)` — returns the current cash balance
-- `place_stock_order(item_name, quantity, as_of_date)` — places a purchase order for stock of a specific item. This tool must following strict usage rules.
+- `place_stock_order(item_name, quantity, price, order_date)` — places a purchase order for stock
 
-**Always pass the `as_of_date` provided in the task to every tool call.**
+## Task Types — Read the task header to determine which workflow to follow
 
-**Primary Workflow:**
+### TASK TYPE: INQUIRY
+Goal: Check and report stock levels for the requested items. Do NOT run proactive maintenance. Do NOT call `get_full_inventory_report`.
+Workflow:
+1. Call `check_stock_levels` once for each item.
+2. Report status using the Output Format below.
 
-You MUST follow this workflow for EVERY task you receive and execute the steps in sequence.
+### TASK TYPE: RESTOCK ORDER
+Goal: Place stock purchase orders for the specified items using the exact values provided.
+Workflow:
+1. For each item provided, follow the `place_stock_order` Usage Rule below to place the order.
+2. Report the result of each order.
 
-1.  **Proactive Stock Maintenance (Run First)**:
-    a.  Use `get_full_inventory_report(as_of_date)` to get a list of all items currently in stock.
-    b.  For each item in the report, use `check_reorder_status` to identify any items with stock below the minimum required stock level.
-    c.  If any item needs to be reordered, you MUST determine the reorder quantity and then follow the **`place_stock_order` Usage Rule** below to attempt a reorder. The quantity to reorder is `(min_stock_level - current_stock) + 40`.
+### TASK TYPE: MAINTENANCE (default if no task type header is given)
+Goal: Proactively maintain healthy stock levels, then execute any additional assigned task.
+Workflow:
+1. **Proactive Stock Maintenance**:
+   a. Use `get_full_inventory_report` to list all items.
+   b. For each item, use `check_reorder_status` to find items below minimum stock.
+   c. For each item needing reorder, follow the `place_stock_order` Usage Rule. Reorder quantity = `(min_stock_level - current_stock) + 40`.
+2. **Execute Assigned Task**: After maintenance, execute the specific task in the request.
 
-2.  **Execute Assigned Task**: After completing the proactive stock maintenance, proceed to execute the specific task you were originally assigned (e.g., checking stock, placing a specific order). You MUST adhere to all tool usage rules.
+## `place_stock_order` Usage Rule
+Before EVERY call to `place_stock_order`, execute these steps in sequence:
+1. **Determine Order Cost**: Use `get_company_financials` to get `unit_price` if not already provided. Calculate total cost = `quantity * unit_price`.
+2. **Check Funds**: Call `check_cash_balance` to get the current cash balance.
+3. **Verify and Execute**:
+   - If cash balance >= total cost → call `place_stock_order`.
+   - If cash balance < total cost → do NOT place the order; report failure due to insufficient funds.
 
-**Important Tool Usage Rules:**
-
-- **`place_stock_order` Usage Rule**: You MUST follow these steps in sequence BEFORE every single call to `place_stock_order`:
-    1.  **Check Status**: you MUST determine the reorder quantity using formula, quantity = quantity + minimum required level - check_stock_levels
-    2.  **Determine Order Cost**: You must know the `item_name`, `quantity`, and `unit_price`.
-        - If the task does not provide the `unit_price`, use `get_company_financials` to find it.
-        - Calculate the total order cost: `quantity * unit_price`.
-    3.  **Check Funds**: Use `check_cash_balance` to get the current cash balance.
-    4.  **Verify and Execute**: Compare the total order cost to the cash balance.
-        - **If cash balance is greater than or equal to the order cost**, you are authorized to call `place_stock_order`.
-        - **If cash balance is insufficient**, you MUST NOT call `place_stock_order`. You must report that the order failed due to insufficient funds.
-
-**Handle Ambiguity**: If a request is ambiguous or you cannot fulfill it, you MUST respond with a summary of your capabilities and ask for clarification. Do not place any orders if the request is ambiguous.
-
-**Output Format**: You MUST always report inventory status using exactly this format for each item:
+## Output Format
+Report inventory status using exactly this format for each item:
 
 1. **[Item Name]**:
-   - Stock: [current_stock] sheets
-   - Request: [requested_quantity] sheets
-   - Status: Available (if current_stock >= requested_quantity) or Insufficient (if current_stock < requested_quantity)
+   - Stock: [current_stock] units
+   - Requested: [requested_quantity] units
+   - Status: Available | Insufficient | N/A (use N/A if the item was not found in inventory)
 
-Use this format for every item in the request, numbered sequentially. Do not deviate from this structure.
+**Handle Ambiguity**: If the request is ambiguous, describe your capabilities and ask for clarification. Do not place any orders if the request is ambiguous.
 """
 
 @dataclass
@@ -832,34 +841,47 @@ inventory_agent = Agent(
         Tool(check_cash_balance, takes_ctx=True),
         Tool(place_stock_order, takes_ctx=True),
     ],
-    instructions=INVENTORY_INSTRUCTIONS,
+    system_prompt=INVENTORY_SYSTEM_PROMPT,
 )
 
 # Tools for quoting agent
-QUOTING_INSTRUCTIONS = """\
-You are a specialized agent for customer quotes. 
-Your goal is to generate a final, consolidated quote for all items in a customer's request by following a strict, multi-step process.
-
+QUOTING_SYSTEM_PROMPT = """\
+You are the Quoting Agent for Munder Difflin, a paper supply company.
+Your goal is to generate a final, consolidated quote for all items in a customer's request by following a strict, multi-step workflow.
 
 ## Available Tools
 - `get_pricing_and_availability(item_name, quantity, as_of_date)` — returns unit price, total price, current stock, and estimated delivery date for one item
-- `quote_history(customer_request)` — searches historical quotes using keywords from the request; call this ONCE per request, not per item
-- `apply_commission_and_discount(base_quote, discount)` — takes the raw string returned by `get_pricing_and_availability` as `base_quote` and a discount float; applies a fixed 5% commission plus the loyalty discount; returns the final per-unit price
+- `quote_history(customer_request)` — searches historical quotes using keywords from the full request; returns past pricing and discounts
+- `apply_commission_and_discount(base_quote, discount)` — takes the raw string from `get_pricing_and_availability` as `base_quote` and a discount float; applies a fixed 5% commission plus the loyalty discount; returns the final per-unit price
 
 **Always pass the `as_of_date` provided in the task to every tool call that accepts it.**
 
-**Your Primary Workflow:**
+## Workflow
 
-You MUST follow this workflow for EVERY task you receive. If the request contains multiple items, you MUST repeat the following steps for EACH item before providing a final, consolidated answer.
+**Step 1 — Check Quote History (ONCE per request, before processing any item)**
+Call `quote_history` once using the full customer request text. Review the results to decide a single loyalty discount rate to apply to all items.
+- Rate must be a decimal between 0.0 (no discount) and 0.03 (max 3%).
+- If no relevant history is found, use 0.0.
 
-1.  **Process Each Item Individually**: For each item in the request:
-    a.  **Get Base Quote**: Call `get_pricing_and_availability` to get the fundamental details for the item and its requested quantity.
-    b.  **Check History**: Call `quote_history` using the customer's request to see if there are any relevant past orders or discounts that might apply.
-    c.  **Analyze and Decide Discount**: Review the output from `quote_history`. Based on the customer's past orders (e.g., large quantities, frequent orders, or previously applied discounts), decide on a reasonable loyalty discount rate for the current item. The rate MUST be a decimal between 0.0 (no discount) and 0.03 (max 3% discount). If no relevant history is found, you MUST use a discount rate of 0.0.
-    d.  **Generate Item Quote**: Call `apply_commission_and_discount` with the base quote string from step 'a' and the discount rate you decided on in step 'c'. This will generate the complete quote for this single item.
-2.  **Consolidate and Finalize**: After processing all items, combine the individual quotes into a single, clear, and itemized response for the user.
+**Step 2 — Process Each Item Individually**
+For each item in the request:
+  a. Call `get_pricing_and_availability(item_name, quantity, as_of_date)` to get base price, stock, and delivery date.
+  b. Call `apply_commission_and_discount(base_quote, discount)` using the result from step (a) and the discount rate decided in Step 1.
 
-**Handle Ambiguity**: If a request is ambiguous or you cannot fulfill it, you MUST respond with a summary of your capabilities and ask for clarification. Do not provide a quote if the request is ambiguous.
+**Step 3 — Consolidate and Finalize**
+After processing all items, combine results into a single itemized quote response. Include per-item unit price, total price, availability, and estimated delivery date.
+
+## Output Format
+After the analysis, output a JSON array named 'quote_details' with one object per item using exactly these fields:
+item_name, qty_requested, current_stock, unit_price, total_price, estimated_delivery_date, availability
+
+Example:
+quote_details: [
+  {"item_name": "Glossy Paper", "qty_requested": 200, "current_stock": 587, "unit_price": 0.22, "total_price": 44.00, "estimated_delivery_date": "2025-04-05", "availability": "In Stock"},
+  {"item_name": "Cardstock", "qty_requested": 100, "current_stock": 50, "unit_price": 0.17, "total_price": 17.00, "estimated_delivery_date": "2025-04-06", "availability": "Low Stock"}
+]
+
+**Handle Ambiguity**: If a request is ambiguous or you cannot fulfill it, describe your capabilities and ask for clarification. Do not provide a quote if the request is ambiguous.
 """
 
 @dataclass
@@ -982,12 +1004,36 @@ quoting_agent = Agent(
         Tool(quote_history, takes_ctx=True),
         Tool(apply_commission_and_discount, takes_ctx=True),
     ],
-    instructions=QUOTING_INSTRUCTIONS,
+    system_prompt=QUOTING_SYSTEM_PROMPT,
 )
 
 # Tools for business advisor agent
-BUSINESS_ADVISOR_INSTRUCTIONS = """\
-You are the Business Advisor Agent. Analyzes the shared text to decide the next action"
+BUSINESS_ADVISOR_SYSTEM_PROMPT = """\
+You are the Business Advisor Agent for Munder Difflin, a paper supply company.
+Your role is to analyze inventory status and quotes, then decide the correct fulfillment action for each item in a customer request.
+
+## Decision Rules (apply independently per item)
+
+- **FINALIZE_ORDER**: Status is "Available" AND current_stock >= qty_requested. The item is in stock and can be shipped immediately.
+- **REORDER_STOCK**: Status is "Insufficient" OR "N/A" (item not found or zero stock), AND the estimated supplier delivery date is ON OR BEFORE the customer deadline. We can restock in time.
+- **CANNOT_FULFILL**: Status is "Insufficient" OR "N/A", AND the estimated supplier delivery date would MISS the customer deadline. We cannot fulfill in time.
+
+## Critical Rules
+
+- "N/A" status means the item is absent from current inventory. It is NEVER eligible for FINALIZE_ORDER.
+- Always compare the estimated delivery date against the customer deadline when status is not "Available".
+- Never invent data. Use only the inventory and quote information provided in the task.
+
+## Output Format
+
+After your analysis, output a JSON array with one object per item using EXACTLY these fields:
+item_name, qty_requested, current_stock, unit_price, total_price, estimated_delivery_date, customer_deadline, status, action
+
+Example:
+business_analysis_details: [
+  {"item_name": "Glossy Paper", "qty_requested": 200, "current_stock": 587, "unit_price": 0.21, "total_price": 42.00, "estimated_delivery_date": "2025-04-05", "customer_deadline": "2025-04-15", "status": "Available", "action": "FINALIZE_ORDER"},
+  {"item_name": "Cardstock", "qty_requested": 100, "current_stock": 50, "unit_price": 0.16, "total_price": 16.00, "estimated_delivery_date": "2025-04-20", "customer_deadline": "2025-04-15", "status": "Insufficient", "action": "CANNOT_FULFILL"}
+]
 """
 @dataclass
 class BusinessAdvisoryDependencies:
@@ -1001,17 +1047,23 @@ business_advisor_agent = Agent(
     model,
     #deps_type = BusinessAdvisoryDependencies,
     #output_type=BusinessAdvisoryOutput,
-    instructions=BUSINESS_ADVISOR_INSTRUCTIONS,
+    system_prompt=BUSINESS_ADVISOR_SYSTEM_PROMPT,
 )
 
 # Tools for sales agent
 
-SALES_INSTRUCTIONS = """\
+SALES_SYSTEM_PROMPT = """\
 You are the Sales Agent for Munder Difflin, a paper supply company.
 Your sole responsibility is to finalize confirmed customer orders by recording them as sales transactions.
 
 ## Available Tool
 - `finalize_order(item_name, quantity, price, order_date)` — creates a sales transaction for one item
+
+**Parameter clarification for `finalize_order`:**
+- `item_name`: exact product name (case-sensitive)
+- `quantity`: number of units ordered (integer)
+- `price`: the **unit price per item** (not the total) — the tool calculates the total internally as `quantity * price`
+- `order_date`: date in ISO format YYYY-MM-DD
 
 **Note:** `finalize_order` verifies stock internally. If stock is insufficient it returns an error string — do not retry; report the failure to the caller.
 
@@ -1019,18 +1071,19 @@ Your sole responsibility is to finalize confirmed customer orders by recording t
 
 For each item in the order:
 1. Call `finalize_order(item_name, quantity, price, order_date)` using the exact values provided in the task.
+   - Pass the **unit price** (price per single item) as the `price` argument, not the total price.
 2. If the tool returns a confirmation with a transaction ID → the item is successfully recorded.
-3. If the tool returns an error (e.g. insufficient stock) → report the failure clearly; do not attempt the order again.
+3. If the tool returns an error (e.g. insufficient stock) → report the failure clearly; do not retry.
 
-If an order contains multiple items, process each item with a separate `finalize_order` call.
+If an order contains multiple items, call `finalize_order` once per item in separate calls.
 
 ## Output
 Return a concise summary that includes for each item:
-- Item name, quantity, and total price
+- Item name, quantity, unit price, and total price
 - Transaction ID (on success) or reason for failure (on error)
 
 ## Handling Ambiguity
-If required fields (`item_name`, `quantity`, `price`, or `order_date`) are missing or ambiguous, do NOT call `finalize_order`. Instead, state clearly what information is missing and ask for it.
+If `item_name`, `quantity`, `price`, or `order_date` are missing or ambiguous, do NOT call `finalize_order`. State clearly what is missing and ask for it.
 """
 
 @dataclass
@@ -1083,38 +1136,48 @@ sales_agent = Agent(
     tools=[            
         Tool(finalize_order, takes_ctx=True),
     ],
-    instructions=SALES_INSTRUCTIONS,
+    system_prompt=SALES_SYSTEM_PROMPT,
 )
 
 # Tool for orchestrator agent to call the other agents and manage the workflow
 # Set up your agents and create an orchestration agent that will manage them.
 
-ORCHESTATOR_INSTRUCTIONS = """\
-You are a specialized customer service agent for a paper supply company. 
-Your sole responsibility MUST be to handle customer inquiries and orders for paper products.
+ORCHESTATOR_SYSTEM_PROMPT = """\
+You are the Customer Service Agent for Munder Difflin, a paper supply company.
+Your sole responsibility is to handle customer inquiries and orders for paper products by routing them through the `handle_customer_request` tool.
 
 ## Available Tool
-You must process every customer request by using the `handle_customer_request` tool.
+- `handle_customer_request(customer_request, as_of_date)` — processes any customer paper request end-to-end
 
-**CRITICAL RULE:** For ANY user input that is a request for paper, you MUST call the `handle_customer_request` tool. Do NOT answer the user directly with advice. Your entire purpose is to call this tool to process the order.
+**CRITICAL RULES:**
+- For ANY customer input about paper products, you MUST call `handle_customer_request`. Do NOT answer directly.
+- Do NOT advise customers to buy from other companies. You ARE the company.
+- Do NOT act as a general assistant.
 
-- **DO NOT** provide advice on how to order paper from other companies. You ARE the company.
-- **DO NOT** act as a general assistant.
-- **ALWAYS** MUST use the `handle_customer_request` tool to get the result.
+## Formatting the Final Response
 
-After the tool returns a result, you will present that result to the user. When formatting the final response, you MUST adhere to the following rules:
-1.  **Relevant Information**: Ensure your response contains all the information directly relevant to the customer's request.
-2.  **Provide Reasoning**: If the tool's output includes any decisions made (e.g., why an item cannot be fulfilled, or why a certain delivery date is given), you MUST include that reasoning in your response to the customer to provide transparency.
-3.  **Protect Sensitive Information**: If the tool's output contains any internal details that are not relevant or relative to PII data or appropriate for the customer (e.g., internal stock levels, financial details, or supplier information), you MUST omit those details from the final response. Your final response to the customer MUST NOT reveal sensitive internal company information PII data. Only share what is necessary and helpful for the customer's understanding of their order status or inquiry.
-4.  **Output Template**: You MUST always format the list of items using exactly this template:
+After `handle_customer_request` returns, format the response to the customer following these rules:
 
-Your order for the following paper supplies can be fulfilled and will be processed for delivery by [DELIVERY_DATE]:
+1. **Include all relevant information** from the tool result that is useful to the customer.
+2. **Explain decisions transparently** — if an item cannot be fulfilled or has a specific delivery date, briefly explain why (e.g., "out of stock", "delivery would miss your deadline").
+3. **Protect sensitive information** — omit internal stock levels, financial details, supplier names, transaction IDs, and any PII not provided by the customer.
 
-- [QUANTITY] [UNIT] of [ITEM_NAME]
-- [QUANTITY] [UNIT] of [ITEM_NAME]
-...
+4. **Use this output template**, adapting the sections based on what was fulfilled:
 
-Replace [DELIVERY_DATE] with the actual estimated delivery date, and each line with the real item details from the order. Use this format for every response that involves a list of items, whether it is a quote, an order confirmation, or an inventory inquiry.
+---
+Thank you for your request. Here is the status of your order:
+
+**Confirmed items** (to be delivered by [DELIVERY_DATE]):
+- [QUANTITY] [UNIT] of [ITEM_NAME] — $[TOTAL_PRICE]
+
+**Items being restocked** (expected delivery by [RESTOCK_DATE]):
+- [QUANTITY] [UNIT] of [ITEM_NAME] — we are placing a supply order to fulfill your request
+
+**Items we cannot fulfill** (delivery deadline cannot be met):
+- [ITEM_NAME] — [brief reason, e.g., "supplier delivery would arrive after your deadline of [DATE]"]
+
+Omit any section that has no items. If all items are confirmed, only show the "Confirmed items" section.
+---
 """
 
 @dataclass
@@ -1141,10 +1204,37 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
     """
 
     print("DEBUG_handle_customer_request FUNC call\n\n")
-    #Step 1: normalize the request and extract the key iteam names.
+
+    print("customer_request=", customer_request)
+    print("\n\n")
+
+    # Initialize all agent results to None so accesses never raise NameError
+    inventory_result_message = None
+    quote_result_message = None
+    business_advisor_result = None
+    sales_result_message = None
+
+    #Step 1: normalize the request and extract the key item names.
     customer_request_lower = customer_request.lower()
 
-    # determinate request type
+    #Step2: Extract expected delivery deadline from the customer request (e.g. "by April 15, 2025" or "before 2025-04-15")
+    customer_deadline = None
+    deadline_match = re.search(
+        r'(?:by|before|for|needed by|deliver(?:ed)? by)\s+([A-Za-z]+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})',
+        customer_request, re.IGNORECASE
+    )
+    if deadline_match:
+        raw_deadline = deadline_match.group(1).strip()
+        for fmt in ("%B %d, %Y", "%B %d %Y", "%Y-%m-%d"):
+            try:
+                from datetime import datetime
+                customer_deadline = datetime.strptime(raw_deadline, fmt).date()
+                break
+            except ValueError:
+                continue
+    print("customer_deadline=", customer_deadline)
+
+    #Step4: determinate request type
     is_inquiry = any(keyword in customer_request_lower for keyword in ["what do you have", "check", "stock", "inventory", "is there", "availability", "in stock"])
     is_quote = any(keyword in customer_request_lower for keyword in ["quote", "price", "cost", "how much", "pricing"])
     is_purchase = any(keyword in customer_request_lower for keyword in ["place order", "accept", "i'll take", "proceed","yes", "go ahead", "buy", "purchase"])
@@ -1161,91 +1251,299 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
     print("is_quote", is_quote)
     print("is_purchase", is_purchase)
 
-    #Step 2: get the list of items
-
-    if is_inquiry and not is_quote and not is_purchase:
-         print("DEBUG_inventory_agent_run FUNC call\n\n")
-
-         items_quantities = ", ".join(f"{q} x {i}" for i, q in zip(items_mentioned, quantities_mentioned))
-         inventory_result_message = await inventory_agent.run(
-             f"Customer is asking about inventory as of {as_of_date}. "
-             f"Original request: {customer_request}. "
-             f"Items and quantities requested: {items_quantities}. "
-             f"For each item, call check_stock_levels and report the result using the required output format."
-         )
-        
-    print("inventory_result_message=", inventory_result_message.output)
-
+    #Step 5: extract exact item names and quantities from the customer request
     items_mentioned = []
     quantities_mentioned = []
+    unresolved_items = []  # items extracted but not found in our catalog
 
-    # Extract (quantity, item phrase) pairs directly from the request structure
-    pair_pattern = r'(\d+)\s*(?:sheets?|units?|reams?|rolls?|boxes?)?\s+(?:of\s+)?([a-zA-Z][a-zA-Z0-9\s\(\)\-]+?)(?=\s*(?:,|\band\b|\.|$))'
-    pairs = re.findall(pair_pattern, customer_request_lower, re.IGNORECASE)
+    # Fix: unit group is optional but must own its leading space to avoid consuming
+    # the separator space when no unit word is present (e.g. "200 balloons").
+    # Also added \bfor\b as a lookahead terminator so "200 balloons for the parade"
+    # stops at "balloons" and doesn't absorb the trailing phrase.
+    pair_pattern = r'(\d[\d,]*)(?:\s+(?:sheets?|units?|reams?|rolls?|boxes?))?\s+(?:of\s+)?([a-zA-Z][a-zA-Z0-9\s\(\)\-]+?)(?=\s*(?:,|\band\b|\bfor\b|\.|$))'
+    pairs = re.findall(pair_pattern, customer_request_lower, re.IGNORECASE | re.MULTILINE)
 
     for qty_str, item_candidate in pairs:
         clean_candidate = re.sub(r'\(.*?\)', '', item_candidate).strip()
+        qty = int(qty_str.replace(',', ''))
         resolved = find_matching_item_by_name(clean_candidate)
         if resolved:
             items_mentioned.append(resolved)
-            quantities_mentioned.append(int(qty_str))
+            quantities_mentioned.append(qty)
+        else:
+            # Keep unresolved items so they can be reported as N/A to the customer
+            unresolved_items.append({"item_name": clean_candidate, "qty_requested": qty})
+            print(f"DEBUG_unresolved: '{clean_candidate}' not found in catalog — will mark N/A")
 
-    print("items_mentioned=", items_mentioned)
-    print("quantities_mentioned=", quantities_mentioned)
+    #Step 6: check inventory for the extracted items
 
-    #Step 3: get a quote from the quoting agent
+    if items_mentioned:
+        print("DEBUG_inventory_agent_run FUNC call\n\n")
+
+        items_quantities = ", ".join(f"{q} x {i}" for i, q in zip(items_mentioned, quantities_mentioned))
+        inventory_result_message = await inventory_agent.run(
+            f"TASK TYPE: INQUIRY. Do NOT run proactive stock maintenance. Do NOT call get_full_inventory_report.\n"
+            f"Call check_stock_levels ONCE for each item below, then report using the required output format.\n"
+            f"Date: {as_of_date}.\n"
+            f"Items to check: {items_quantities}.\n"
+            f"After the report, output a JSON array named 'inventory_details' with one object per item using exactly these fields: "
+            f"item_name, qty_requested, current_stock, status.\n"
+            f"Status rules: use 'Available' if current_stock >= qty_requested, 'Insufficient' if current_stock < qty_requested, 'N/A' if the item was not found in inventory.\n"
+            f"Example JSON format:\n"
+            f"inventory_details: [\n"
+            f"  {{\"item_name\": \"Glossy Paper\", \"qty_requested\": 200, \"current_stock\": 587, \"status\": \"Available\"}},\n"
+            f"  {{\"item_name\": \"Cardstock\", \"qty_requested\": 100, \"current_stock\": 50, \"status\": \"Insufficient\"}},\n"
+            f"  {{\"item_name\": \"Unknown Item\", \"qty_requested\": 50, \"current_stock\": 0, \"status\": \"N/A\"}}\n"
+            f"]"
+        )
+
+    #Step 7: check inventoru_details before quoting
+
+    inventory_details = []
+    if inventory_result_message is not None:
+        print("inventory_result_message=", inventory_result_message.output)
+        inventory_json_match = re.search(r'inventory_details\s*:\s*(\[.*?\])', inventory_result_message.output, re.DOTALL)
+        if inventory_json_match:
+            try:
+                inventory_details = json.loads(inventory_json_match.group(1))
+                print("inventory_details=", json.dumps(inventory_details, indent=2))
+            except json.JSONDecodeError as e:
+                print(f"Warning: could not parse inventory_details JSON: {e}")
+        else:
+            print("Warning: inventory_details JSON block not found in inventory agent output.")
+
+    # Step 7a: Append unresolved items (not in our catalog) as N/A — no restock possible
+    already_named = {i["item_name"].lower() for i in inventory_details}
+    for u in unresolved_items:
+        if u["item_name"].lower() not in already_named:
+            inventory_details.append({
+                "item_name": u["item_name"],
+                "qty_requested": u["qty_requested"],
+                "current_stock": 0,
+                "status": "N/A",
+            })
+            print(f"DEBUG_na_item: added '{u['item_name']}' as N/A (not in catalog, cannot restock)")
+
+    #Step 7b: For Insufficient items, attempt restock if delivery is before customer deadline
+
+    insufficient_items = [i for i in inventory_details if i.get("status") == "Insufficient"]
+
+    if insufficient_items and customer_deadline:
+        print("DEBUG_restock_check: found insufficient items, checking delivery feasibility")
+        restock_candidates = []
+
+        for item in insufficient_items:
+            item_name = item["item_name"]
+            qty_needed = int(item["qty_requested"] * 1.1)
+            estimated_delivery_str = get_supplier_delivery_date(as_of_date, qty_needed)
+            estimated_delivery = datetime.fromisoformat(estimated_delivery_str).date()
+            print(f"  {item_name}: delivery {estimated_delivery_str}, deadline {customer_deadline}")
+
+            customer_delivery_date = estimated_delivery
+            print(f"  {item_name}: restock arrives {estimated_delivery_str}, customer delivery {customer_delivery_date}, deadline {customer_deadline}")
+
+            if customer_delivery_date <= customer_deadline:
+                restock_candidates.append({
+                    "item_name": item_name,
+                    "qty_requested": qty_needed,
+                    "estimated_delivery": estimated_delivery_str,
+                    "customer_delivery_date": str(customer_delivery_date),
+                })
+            else:
+                print(f"  {item_name}: customer delivery {customer_delivery_date} misses deadline — keeping Insufficient")
+
+        if restock_candidates:
+            # Check cash balance once before any restock
+            cash_balance = get_cash_balance(as_of_date)
+            print(f"DEBUG_restock_check: cash balance = ${cash_balance:.2f}")
+
+            affordable_candidates = []
+            for c in restock_candidates:
+                price_df = pd.read_sql(
+                    "SELECT unit_price FROM inventory WHERE item_name = :name",
+                    db_engine, params={"name": c["item_name"]}
+                )
+                if price_df.empty:
+                    print(f"  {c['item_name']}: unit price not found — keeping Insufficient")
+                    continue
+                unit_price = float(price_df.iloc[0]["unit_price"])
+                order_cost = unit_price * c["qty_requested"]
+                if cash_balance >= order_cost:
+                    affordable_candidates.append({**c, "unit_price": unit_price, "order_cost": order_cost})
+                    cash_balance -= order_cost  # deduct to account for subsequent items
+                    print(f"  {c['item_name']}: cost=${order_cost:.2f} — affordable, added to restock")
+                else:
+                    print(f"  {c['item_name']}: cost=${order_cost:.2f} exceeds balance ${cash_balance:.2f} — keeping Insufficient")
+
+            if affordable_candidates:
+                restock_items_str = "\n".join(
+                    f"- item_name: {c['item_name']}, quantity: {c['qty_requested']}, unit_price: {c['unit_price']:.4f}, order_date: {as_of_date}"
+                    for c in affordable_candidates
+                )
+                print("DEBUG_restock_order: placing restock orders via inventory agent")
+                await inventory_agent.run(
+                    f"TASK TYPE: RESTOCK ORDER. Do NOT run proactive stock maintenance.\n"
+                    f"Call place_stock_order once for each item below using the exact values provided.\n"
+                    f"Date: {as_of_date}.\n{restock_items_str}"
+                )
+            restock_candidates = affordable_candidates
+
+            # Re-check inventory for restocked items and update inventory_details
+            for item in inventory_details:
+                candidate = next((c for c in restock_candidates if c["item_name"] == item["item_name"]), None)
+                if candidate:
+                    updated_stock_df = get_stock_level(item["item_name"], as_of_date)
+                    if not updated_stock_df.empty:
+                        new_stock = int(updated_stock_df.iloc[0]["current_stock"])
+                        item["current_stock"] = new_stock
+                        item["status"] = "Available" if new_stock >= item["qty_requested"] else "Insufficient"
+                        # Set the correct customer-facing delivery date: restock arrival + 1 day
+                        item["estimated_delivery_date"] = candidate["customer_delivery_date"]
+                        print(f"  Re-checked {item['item_name']}: new stock={new_stock}, status={item['status']}, customer delivery={candidate['customer_delivery_date']}")
+
+        print("inventory_details after restock=", json.dumps(inventory_details, indent=2))
+
+    #Step 8: get a quote from the quoting agent using exact DB item names
 
     print("DEBUG_quote_agent_run FUNC call\n\n")
-    quote_task = """\
-        Provide a detailed quote for each item in the following request as of {as_of_date}: {inventory_result_message}.
-        The quote will include item name, quantity, total price, estimated delivery date,
-        current stock level and current stock status (sufficient if current stock level >= quantity else insufficient).
-        """
-    quote_result_message = await quoting_agent.run(quote_task)
-    quote_result = str(quote_result_message.output)
+    items_quantities = ", ".join(f"{q} x {i}" for i, q in zip(items_mentioned, quantities_mentioned))
 
-    print("quote_result", quote_result)
+    # Build delivery date overrides for items that were restocked in Step 7b
+    restocked_delivery_overrides = {
+        item["item_name"]: item["estimated_delivery_date"]
+        for item in inventory_details
+        if "estimated_delivery_date" in item
+    }
+    override_note = ""
+    if restocked_delivery_overrides:
+        override_lines = "\n".join(
+            f"  - {name}: use {date} as estimated_delivery_date (stock arrives from supplier on this date)"
+            for name, date in restocked_delivery_overrides.items()
+        )
+        override_note = (
+            f"\nIMPORTANT — delivery date overrides for restocked items (do NOT call get_supplier_delivery_date for these; use the date provided):\n"
+            f"{override_lines}\n"
+        )
 
-    #Step 3: use the business analysis agent to analyze the quote and decide the next action.
+    quote_result_message = await quoting_agent.run(
+        f"Provide a detailed quote as of {as_of_date} for these items: {items_quantities}. "
+        f"Use the exact item names provided. "
+        f"{override_note}"
+        f"After the quote, output a JSON array named 'quote_details' with one object per item using exactly these fields: "
+        f"item_name, qty_requested, current_stock, unit_price, total_price, estimated_delivery_date, status. "
+        f"Retrieve current_stock from the get_pricing_and_availability tool output (labeled 'Current Availability'). "
+        f"Example JSON format:\n"
+        f"quote_details: [\n"
+        f"  {{\"item_name\": \"Glossy Paper\", \"qty_requested\": 200, \"current_stock\": 587, \"unit_price\": 0.21, \"total_price\": 42.00, \"estimated_delivery_date\": \"2025-04-05\", \"status\": \"Available\"}},\n"
+        f"  {{\"item_name\": \"Cardstock\", \"qty_requested\": 100, \"current_stock\": 50, \"unit_price\": 0.16, \"total_price\": 16.00, \"estimated_delivery_date\": \"2025-04-02\", \"status\": \"Insufficient\"}}\n"
+        f"]"
+    )
 
-    business_analysis_agent_instructions = f"""\
-    Analyze the following quote from the quoting_agent and determine the next action based on the strict rules provided.
-    Quote: "{quote_result}"
 
-    Rules:
-    1. if current stock is sufficient
-    2. 
-    """
+    #Step 9: Extract quote_details JSON from the quoting agent output
+    quote_details = []
+    quote_json_match = re.search(r'quote_details\s*:\s*(\[.*?\])', quote_result_message.output, re.DOTALL)
+    if quote_json_match:
+        try:
+            quote_details = json.loads(quote_json_match.group(1))
+            print("quote_details=", json.dumps(quote_details, indent=2))
+        except json.JSONDecodeError as e:
+            print(f"Warning: could not parse quote_details JSON: {e}")
+    else:
+        print("Warning: quote_details JSON block not found in quoting agent output.")
 
+    #Step 10: use the business analysis agent to analyze the quote and decide the next action.
+    print("DEBUG_ba_analysis_agent_run FUNC call\n\n")
+    inventory_summary = json.dumps(inventory_details, indent=2) if inventory_details else "No inventory data available."
+    business_analysis_agent_instructions = (
+        f"Inventory status:\n{inventory_summary}\n\n"
+        f"Quote:\n{quote_result_message.output}\n\n"
+        f"Customer deadline: {customer_deadline}\n\n"
+        f"Rules (apply per item):\n"
+        f"- Status is 'Available' AND current_stock >= qty_requested → FINALIZE_ORDER\n"
+        f"- Status is 'Insufficient' (low stock or zero stock), AND a supplier delivery date is on or before the customer deadline → REORDER_STOCK\n"
+        f"- Status is 'N/A' (item not found) → CANNOT_FULFILL\n"
+        f"IMPORTANT: 'N/A' status means the item is not in our current inventory. It is NEVER sufficient for FINALIZE_ORDER. Always apply the REORDER_STOCK or CANNOT_FULFILL rule.\n\n"
+        f"After the analysis, output a JSON array named 'business_analysis_details' with one object per item using exactly these fields: "
+        f"item_name, qty_requested, current_stock, unit_price, total_price, estimated_delivery_date, customer_deadline, status (Available, Insufficient, or N/A), action (FINALIZE_ORDER, REORDER_STOCK, or CANNOT_FULFILL).\n"
+        f"Take current_stock from the inventory status provided above. If not available, use 0.\n"
+        f"Example JSON format:\n"
+        f"business_analysis_details: [\n"
+        f"  {{\"item_name\": \"Glossy Paper\", \"qty_requested\": 200, \"current_stock\": 587, \"unit_price\": 0.21, \"total_price\": 42.00, \"estimated_delivery_date\": \"2025-04-05\", \"customer_deadline\": \"2025-04-15\", \"status\": \"Available\", \"action\": \"FINALIZE_ORDER\"}},\n"
+        f"  {{\"item_name\": \"Cardstock\", \"qty_requested\": 100, \"current_stock\": 50, \"unit_price\": 0.16, \"total_price\": 16.00, \"estimated_delivery_date\": \"2025-04-02\", \"customer_deadline\": \"2025-04-15\", \"status\": \"Insufficient\", \"action\": \"REORDER_STOCK\"}}\n"
+        f"]"
+    )
 
-    
+    business_advisor_result = await business_advisor_agent.run(business_analysis_agent_instructions)
+    ba_analysis_result = business_advisor_result.output
+    print("ba_analysis_result=", ba_analysis_result)
 
-    # elif is_quote or is_purchase:
-    #     # Step 2: Get a quote from the quoting agent.
-    #     print("DEBUG_quote_agent_run FUNC call\n\n")
-    #     quote_task = (
-    #         f"Provide a detailed quote for each item in the following request as of {as_of_date}: {customer_request_lower}."
-    #         f" The quote will include item name, quantity, total price, estimated delivery date,"
-    #         f" current stock level and current stock status (sufficient if current stock level >= quantity else insufficient)."
-    #     )
-    #     quote_result_message = await quoting_agent.run(quote_task)
-    #     quote_result = quote_result_message.output
-    #     print("quote_result", quote_result)
+    #Step 11: Route each item to the appropriate agent based on BA decision
 
-    #     if is_purchase:
-    #         # Step 3: Finalize the order via the sales agent using the quoted details.
-    #         sales_result = await sales_agent.run(
-    #             f"Finalize the following customer order as of {as_of_date}. "
-    #             f"Customer request: {customer_request}. "
-    #             f"Use the quoted details below to place the sale transactions:\n{quote_result}"
-    #         )
-    #         return f"Quote:\n{quote_result}\n\nOrder Confirmation:\n{sales_result.output}"
+    #Step 11a: Parse the JSON array from the BA agent's text output
+    import re as _re
+    _json_match = _re.search(r'\[.*?\]', ba_analysis_result, _re.DOTALL)
+    if not _json_match:
+        return "We apologize — we could not parse the business analysis. Please try again."
+    try:
+        business_analysis_details = json.loads(_json_match.group())
+    except json.JSONDecodeError:
+        return "We apologize — we could not parse the business analysis. Please try again."
 
-    #     return quote_result
+    print("business_analysis_details=", business_analysis_details)
 
-     
+    finalize_items = [i for i in business_analysis_details if i.get("action") == "FINALIZE_ORDER"]
+    reorder_items  = [i for i in business_analysis_details if i.get("action") == "REORDER_STOCK"]
+    cannot_items   = [i for i in business_analysis_details if i.get("action") == "CANNOT_FULFILL"]
 
-    return f"I was unable to determine the type of request. Please clarify your inquiry."
+    print("DEBUG_finalize_items",finalize_items)
+    print("DEBUG_reorder_items",reorder_items)
+    print("DEBUG_cannot_items",cannot_items)
+
+    #Step 11b: --- Sales agent: finalize confirmed orders ---
+    if finalize_items:
+        items_list = "\n".join(
+            f"- item_name: {i['item_name']}, quantity: {i['qty_requested']}, "
+            f"unit_price: {i['unit_price']}, total_price: {i['total_price']}, order_date: {as_of_date}"
+            for i in finalize_items
+        )
+        sales_result_message = await sales_agent.run(
+            f"Finalize the following confirmed orders as of {as_of_date}. "
+            f"Call finalize_order once per item using the exact values below:\n{items_list}"
+        )
+        print("sales_result=", sales_result_message.output)
+
+    #Step 11c: --- Inventory agent: place restock orders ---
+    if reorder_items:
+        items_list = "\n".join(
+            f"- item_name: {i['item_name']}, quantity: {i['qty_requested']}, "
+            f"unit_price: {i['unit_price']}, total_price: {i['total_price']}, order_date: {as_of_date}"
+            for i in reorder_items
+        )
+        reorder_result_message = await inventory_agent.run(
+            f"TASK TYPE: RESTOCK ORDER. Do NOT run proactive stock maintenance.\n"
+            f"Call place_stock_order once for each item below using the exact values provided.\n"
+            f"Date: {as_of_date}.\n{items_list}"
+        )
+        print("reorder_result=", reorder_result_message.output)
+
+    #Step 12: --- Build final response ---
+    response_parts = []
+    if finalize_items:
+        response_parts.append(sales_result_message.output)
+    if reorder_items:
+        response_parts.append(reorder_result_message.output)
+    if cannot_items:
+        names = ", ".join(i["item_name"] for i in cannot_items)
+        response_parts.append(
+            f"The following items cannot be fulfilled by the customer's deadline: {names}."
+        )
+    if not response_parts:
+        return "No actionable items were found in your request."
+
+    return "\n\n".join(response_parts)
+
+# initiatize orchestrator agent
 
 orchestrator = Agent(
     model,
@@ -1254,7 +1552,7 @@ orchestrator = Agent(
     tools=[            
         Tool(handle_customer_request, takes_ctx=True),
     ],
-    instructions=ORCHESTATOR_INSTRUCTIONS,
+    system_prompt=ORCHESTATOR_SYSTEM_PROMPT,
 )
 
 # @orchestrator.tool
@@ -1345,7 +1643,7 @@ def run_test_scenarios():
 
     results = []
     #for idx, row in quote_requests_sample.iterrows():
-    for idx, row in quote_requests_sample.head(1).iterrows():
+    for idx, row in quote_requests_sample.head(3).iterrows():
         request_date = row["request_date"].strftime("%Y-%m-%d")
 
         print(f"\n=== Request {idx+1} ===")
