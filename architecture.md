@@ -40,8 +40,8 @@ The system uses **5 agents** organized in a fixed orchestration pipeline — not
 - **Tools**:
   - `get_pricing_and_availability(item_name, quantity, as_of_date)` → reads `inventory` table + `get_stock_level()` + `get_supplier_delivery_date()`
   - `quote_history(customer_request)` → `search_quote_history()` (keyword-based search across `quotes` + `quote_requests` tables)
-  - `apply_commission_and_discount(base_quote, discount)` → applies fixed 5% commission + variable loyalty discount (0–3%) + mood discount (0–2%)
-- **Pricing**: final price = `unit_price × 1.05 × (1 - loyalty_discount - mood_discount)`
+  - `apply_commission_and_discount(base_quote, discount)` → applies fixed 5% commission + variable loyalty discount (0–3%)
+- **Pricing**: final price = `unit_price × 1.05 × (1 - loyalty_discount)`
 
 ### BusinessAdvisorAgent
 - **Primary Role**: Per-item fulfillment decision making
@@ -70,13 +70,12 @@ Each customer request flows through these steps in sequence:
 | **1** | Normalize request text to lowercase |
 | **2** | Extract customer deadline via regex (e.g. "by April 15, 2025") |
 | **3** | Detect request type: `is_inquiry`, `is_quote`, `is_purchase` via keyword matching |
-| **4** | Detect customer mood → compute extra discount (0–2%) via `detect_customer_mood()` |
 | **5** | Extract `(quantity, item_name)` pairs via regex; resolve item names via `find_matching_item_by_name()`; collect unresolved items |
 | **6** | Call **InventoryAgent** (TASK TYPE: INQUIRY) for all resolved items |
 | **7** | Parse `inventory_details` JSON from agent output |
 | **7a** | Append unresolved items as `status: N/A` — no restock possible |
-| **7b** | For Insufficient items: check delivery feasibility (restock qty = qty×1.1), check cash balance per item, place restock orders via InventoryAgent (TASK TYPE: RESTOCK ORDER), re-check stock, update delivery dates (restock arrival + 1 day) |
-| **8** | Call **QuotingAgent** with items + mood discount + delivery date overrides for restocked items |
+| **7b** | For Insufficient items: check delivery feasibility (restock qty = qty×1.1), check cash balance per item, place restock orders via InventoryAgent (TASK TYPE: RESTOCK ORDER), re-check stock, update delivery dates |
+| **8** | Call **QuotingAgent** with items + delivery date overrides for restocked items |
 | **9** | Parse `quote_details` JSON from quoting agent output |
 | **10** | Call **BusinessAdvisorAgent** with inventory summary + quote output + customer deadline |
 | **11a** | Parse `business_analysis_details` JSON from BA agent output |
@@ -95,27 +94,6 @@ Four-pass fuzzy matching against the `inventory` table:
 4. **Word-overlap scoring** — stop words include `"paper"` to prevent false matches across all paper items
 
 Returns `None` if no match — unresolved items become N/A entries.
-
----
-
-## Customer Mood Detection (`detect_customer_mood`)
-
-Keyword-based scoring applied to the raw request text before item extraction:
-
-| Signal | Keywords | Points |
-|--------|----------|--------|
-| Politeness | please, thank you, kindly, appreciate, grateful… | +1 each |
-| Enthusiasm | excited, love, amazing, fantastic, thrilled… | +2 each |
-| Frustration | urgent, asap, disappointed, problem, complaint… | −1 each |
-
-| Score | Label | Extra Discount |
-|-------|-------|----------------|
-| ≥ 3 | very_positive | 2.0% |
-| 2 | positive | 1.5% |
-| 1 | polite | 1.0% |
-| ≤ 0 | neutral | 0.0% |
-
-The discount is passed to the QuotingAgent prompt and added on top of the loyalty discount.
 
 ---
 
@@ -172,10 +150,9 @@ Triggered automatically when inventory is `Insufficient` and a customer deadline
 ## Pricing Formula
 
 ```
-final_unit_price = unit_price × 1.05 × (1 − loyalty_discount − mood_discount)
+final_unit_price = unit_price × 1.05 × (1 − loyalty_discount)
 ```
 
 - `unit_price`: from `inventory` table
 - `1.05`: fixed 5% sales commission
 - `loyalty_discount`: 0.0–0.03 (based on quote history)
-- `mood_discount`: 0.0–0.02 (based on customer tone)
