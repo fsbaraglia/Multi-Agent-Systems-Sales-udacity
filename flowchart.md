@@ -125,13 +125,13 @@ graph LR
     PIPELINE --> BA(["BusinessAdvisorAgent"])
     PIPELINE --> SALES(["SalesAgent"])
 
-    INV --- INV_T["check_stock_levels\ncheck_reorder_status\nget_full_inventory_report\ncheck_delivery_timeline\nget_company_financials\ncheck_cash_balance\nplace_stock_order"]
+    INV --- INV_T["check_stock_levels → get_stock_level()\ncheck_reorder_status → inventory table min_stock_level\nget_full_inventory_report → get_all_inventory()\ncheck_delivery_timeline → get_supplier_delivery_date()\nget_company_financials → generate_financial_report()\ncheck_cash_balance → get_cash_balance()\nplace_stock_order → create_transaction(type=stock_orders)"]
 
-    QUOT --- QUOT_T["get_pricing_and_availability\nquote_history\napply_commission_and_discount"]
+    QUOT --- QUOT_T["get_pricing_and_availability → inventory table + get_stock_level() + get_supplier_delivery_date()\nquote_history → search_quote_history()\napply_commission_and_discount → price × 1.05 × (1 − loyalty_discount)"]
 
     BA --- BA_T["No tools\nText analysis only"]
 
-    SALES --- SALES_T["finalize_order"]
+    SALES --- SALES_T["finalize_order → find_matching_item_by_name() + create_transaction(type=sales)"]
 
     INV_T -.->|"reads/writes"| DB[(munder_difflin.db\n─────────────\ninventory\ntransactions\nquote_requests\nquotes)]
     QUOT_T -.->|"reads"| DB

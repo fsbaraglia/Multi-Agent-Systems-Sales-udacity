@@ -626,7 +626,21 @@ sales_agent = Agent()
 
 def find_matching_item_by_name(requested_name: str) -> str:
     """
-    Find the 
+    Fuzzy-match a customer-supplied item name against the catalog in the inventory table.
+
+    Matching is attempted in four passes, returning on the first success:
+      1. Exact match (case-insensitive).
+      2. requested_name is a substring of a catalog item (e.g. "streamers" → "Party streamers").
+      3. A catalog item is a substring of requested_name (e.g. "Poster paper" in "colorful poster paper").
+      4. Word-overlap scoring — counts shared meaningful words, ignoring common stop words
+         (including "paper" to prevent false positives across all paper product names).
+
+    Args:
+        requested_name (str): The raw item name string extracted from the customer request.
+
+    Returns:
+        str | None: The exact catalog item name if a match is found, or None if no match passes
+                    the minimum score threshold. Callers should treat None as "item not in catalog".
     """
     inventory_items = pd.read_sql(
         "SELECT item_name FROM inventory", db_engine
@@ -1189,6 +1203,139 @@ class OrchestratorOutput(BaseModel):
     final_response: str = Field(description="A final summarized outcome to the customer after processing the request through the agents.")
 
 
+async def _run_proactive_restock(
+    inventory_details: list,
+    customer_deadline,
+    as_of_date: str,
+) -> list:
+    """
+    Attempt to proactively restock any items whose status is 'Insufficient' before quoting.
+
+    For each insufficient item this function:
+      1. Calculates the restock quantity as qty_requested × 1.1 (10% buffer).
+      2. Checks if the supplier can deliver by the customer deadline via get_supplier_delivery_date().
+      3. Verifies available cash via get_cash_balance() and a direct inventory price lookup.
+      4. Places a stock order via the inventory_agent (TASK TYPE: RESTOCK ORDER) for affordable items.
+      5. Re-checks actual stock via get_stock_level() and updates inventory_details in-place with
+         the new current_stock, status, and estimated_delivery_date.
+
+    Args:
+        inventory_details (list): Parsed inventory_details dicts; mutated in-place on restock.
+        customer_deadline (datetime.date | None): The customer's required delivery date.
+        as_of_date (str): ISO date string for all DB queries and order records.
+
+    Returns:
+        list: The same inventory_details list, updated in-place for restocked items.
+    """
+    insufficient_items = [i for i in inventory_details if i.get("status") == "Insufficient"]
+    if not insufficient_items or not customer_deadline:
+        return inventory_details
+
+    restock_candidates = []
+    for item in insufficient_items:
+        item_name = item["item_name"]
+        qty_needed = int(item["qty_requested"] * 1.1)
+        estimated_delivery_str = get_supplier_delivery_date(as_of_date, qty_needed)
+        estimated_delivery = datetime.fromisoformat(estimated_delivery_str).date()
+        customer_delivery_date = estimated_delivery
+
+        if customer_delivery_date <= customer_deadline:
+            restock_candidates.append({
+                "item_name": item_name,
+                "qty_requested": qty_needed,
+                "estimated_delivery": estimated_delivery_str,
+                "customer_delivery_date": str(customer_delivery_date),
+            })
+        else:
+            print(f"  {item_name}: customer delivery {customer_delivery_date} misses deadline — keeping Insufficient")
+
+    if not restock_candidates:
+        return inventory_details
+
+    # Check cash balance once; deduct per item to prevent overdraft across multiple restocks
+    cash_balance = get_cash_balance(as_of_date)
+    affordable_candidates = []
+    for c in restock_candidates:
+        price_df = pd.read_sql(
+            "SELECT unit_price FROM inventory WHERE item_name = :name",
+            db_engine, params={"name": c["item_name"]}
+        )
+        if price_df.empty:
+            print(f"  {c['item_name']}: unit price not found — keeping Insufficient")
+            continue
+        unit_price = float(price_df.iloc[0]["unit_price"])
+        order_cost = unit_price * c["qty_requested"]
+        if cash_balance >= order_cost:
+            affordable_candidates.append({**c, "unit_price": unit_price, "order_cost": order_cost})
+            cash_balance -= order_cost
+            print(f"  {c['item_name']}: cost=${order_cost:.2f} — affordable, added to restock")
+        else:
+            print(f"  {c['item_name']}: cost=${order_cost:.2f} exceeds balance ${cash_balance:.2f} — keeping Insufficient")
+
+    if affordable_candidates:
+        restock_items_str = "\n".join(
+            f"- item_name: {c['item_name']}, quantity: {c['qty_requested']}, unit_price: {c['unit_price']:.4f}, order_date: {as_of_date}"
+            for c in affordable_candidates
+        )
+        await inventory_agent.run(
+            f"TASK TYPE: RESTOCK ORDER. Do NOT run proactive stock maintenance.\n"
+            f"Call place_stock_order once for each item below using the exact values provided.\n"
+            f"Date: {as_of_date}.\n{restock_items_str}"
+        )
+
+    # Re-check actual stock and update inventory_details in-place
+    for item in inventory_details:
+        candidate = next((c for c in affordable_candidates if c["item_name"] == item["item_name"]), None)
+        if candidate:
+            updated_stock_df = get_stock_level(item["item_name"], as_of_date)
+            if not updated_stock_df.empty:
+                new_stock = int(updated_stock_df.iloc[0]["current_stock"])
+                item["current_stock"] = new_stock
+                item["status"] = "Available" if new_stock >= item["qty_requested"] else "Insufficient"
+                item["estimated_delivery_date"] = candidate["customer_delivery_date"]
+                print(f"  Re-checked {item['item_name']}: new stock={new_stock}, status={item['status']}, customer delivery={candidate['customer_delivery_date']}")
+
+    return inventory_details
+
+
+def _build_final_response(
+    finalize_items: list,
+    reorder_items: list,
+    cannot_items: list,
+    sales_result_message,
+    reorder_result_message,
+) -> str:
+    """
+    Assemble the final text response returned to the Orchestrator Agent.
+
+    Combines outputs from the SalesAgent and InventoryAgent with a plain-text
+    cannot-fulfill summary. Returns a generic message if no actionable items exist.
+
+    Args:
+        finalize_items (list): Items routed to FINALIZE_ORDER by the BusinessAdvisorAgent.
+        reorder_items (list): Items routed to REORDER_STOCK by the BusinessAdvisorAgent.
+        cannot_items (list): Items routed to CANNOT_FULFILL by the BusinessAdvisorAgent.
+        sales_result_message: The pydantic-ai result object from sales_agent.run(), or None.
+        reorder_result_message: The pydantic-ai result object from inventory_agent.run(), or None.
+
+    Returns:
+        str: A multi-section response string ready for the Orchestrator to format and present.
+    """
+    response_parts = []
+    if finalize_items and sales_result_message:
+        response_parts.append(sales_result_message.output)
+    if reorder_items and reorder_result_message:
+        response_parts.append(reorder_result_message.output)
+    if cannot_items:
+        names = ", ".join(i["item_name"] for i in cannot_items)
+        response_parts.append(
+            f"The following items cannot be fulfilled by the customer's deadline: {names}."
+        )
+    if not response_parts:
+        return "No actionable items were found in your request."
+    return "\n\n".join(response_parts)
+
+
 @orchestrator.tool
 async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], customer_request: str, as_of_date: str) -> str:
     """ Handles a customer's end-to-end request for an order by orchestrating calls to the inventory, 
@@ -1324,84 +1471,8 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
             })
             print(f"DEBUG_na_item: added '{u['item_name']}' as N/A (not in catalog, cannot restock)")
 
-    #Step 7b: For Insufficient items, attempt restock if delivery is before customer deadline
-
-    insufficient_items = [i for i in inventory_details if i.get("status") == "Insufficient"]
-
-    if insufficient_items and customer_deadline:
-        # print("DEBUG_restock_check: found insufficient items, checking delivery feasibility")
-        restock_candidates = []
-
-        for item in insufficient_items:
-            item_name = item["item_name"]
-            qty_needed = int(item["qty_requested"] * 1.1)
-            estimated_delivery_str = get_supplier_delivery_date(as_of_date, qty_needed)
-            estimated_delivery = datetime.fromisoformat(estimated_delivery_str).date()
-            # print(f"  {item_name}: delivery {estimated_delivery_str}, deadline {customer_deadline}")
-
-            customer_delivery_date = estimated_delivery
-            # print(f"  {item_name}: restock arrives {estimated_delivery_str}, customer delivery {customer_delivery_date}, deadline {customer_deadline}")
-
-            if customer_delivery_date <= customer_deadline:
-                restock_candidates.append({
-                    "item_name": item_name,
-                    "qty_requested": qty_needed,
-                    "estimated_delivery": estimated_delivery_str,
-                    "customer_delivery_date": str(customer_delivery_date),
-                })
-            else:
-                print(f"  {item_name}: customer delivery {customer_delivery_date} misses deadline — keeping Insufficient")
-
-        if restock_candidates:
-            # Check cash balance once before any restock
-            cash_balance = get_cash_balance(as_of_date)
-            # print(f"DEBUG_restock_check: cash balance = ${cash_balance:.2f}")
-
-            affordable_candidates = []
-            for c in restock_candidates:
-                price_df = pd.read_sql(
-                    "SELECT unit_price FROM inventory WHERE item_name = :name",
-                    db_engine, params={"name": c["item_name"]}
-                )
-                if price_df.empty:
-                    print(f"  {c['item_name']}: unit price not found — keeping Insufficient")
-                    continue
-                unit_price = float(price_df.iloc[0]["unit_price"])
-                order_cost = unit_price * c["qty_requested"]
-                if cash_balance >= order_cost:
-                    affordable_candidates.append({**c, "unit_price": unit_price, "order_cost": order_cost})
-                    cash_balance -= order_cost  # deduct to account for subsequent items
-                    print(f"  {c['item_name']}: cost=${order_cost:.2f} — affordable, added to restock")
-                else:
-                    print(f"  {c['item_name']}: cost=${order_cost:.2f} exceeds balance ${cash_balance:.2f} — keeping Insufficient")
-
-            if affordable_candidates:
-                restock_items_str = "\n".join(
-                    f"- item_name: {c['item_name']}, quantity: {c['qty_requested']}, unit_price: {c['unit_price']:.4f}, order_date: {as_of_date}"
-                    for c in affordable_candidates
-                )
-                # print("DEBUG_restock_order: placing restock orders via inventory agent")
-                await inventory_agent.run(
-                    f"TASK TYPE: RESTOCK ORDER. Do NOT run proactive stock maintenance.\n"
-                    f"Call place_stock_order once for each item below using the exact values provided.\n"
-                    f"Date: {as_of_date}.\n{restock_items_str}"
-                )
-            restock_candidates = affordable_candidates
-
-            # Re-check inventory for restocked items and update inventory_details
-            for item in inventory_details:
-                candidate = next((c for c in restock_candidates if c["item_name"] == item["item_name"]), None)
-                if candidate:
-                    updated_stock_df = get_stock_level(item["item_name"], as_of_date)
-                    if not updated_stock_df.empty:
-                        new_stock = int(updated_stock_df.iloc[0]["current_stock"])
-                        item["current_stock"] = new_stock
-                        item["status"] = "Available" if new_stock >= item["qty_requested"] else "Insufficient"
-                        # Set the correct customer-facing delivery date: restock arrival + 1 day
-                        item["estimated_delivery_date"] = candidate["customer_delivery_date"]
-                        print(f"  Re-checked {item['item_name']}: new stock={new_stock}, status={item['status']}, customer delivery={candidate['customer_delivery_date']}")
-
-        # print("inventory_details after restock=", json.dumps(inventory_details, indent=2))
+    #Step 7b: For Insufficient items, attempt proactive restock if delivery is before customer deadline
+    inventory_details = await _run_proactive_restock(inventory_details, customer_deadline, as_of_date)
 
     #Step 8: get a quote from the quoting agent using exact DB item names
 
@@ -1496,6 +1567,9 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
     reorder_items  = [i for i in business_analysis_details if i.get("action") == "REORDER_STOCK"]
     cannot_items   = [i for i in business_analysis_details if i.get("action") == "CANNOT_FULFILL"]
 
+    sales_result_message = None
+    reorder_result_message = None
+
     # print("DEBUG_finalize_items",finalize_items)
     # print("DEBUG_reorder_items",reorder_items)
     # print("DEBUG_cannot_items",cannot_items)
@@ -1528,20 +1602,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
         # print("reorder_result=", reorder_result_message.output)
 
     #Step 12: --- Build final response ---
-    response_parts = []
-    if finalize_items:
-        response_parts.append(sales_result_message.output)
-    if reorder_items:
-        response_parts.append(reorder_result_message.output)
-    if cannot_items:
-        names = ", ".join(i["item_name"] for i in cannot_items)
-        response_parts.append(
-            f"The following items cannot be fulfilled by the customer's deadline: {names}."
-        )
-    if not response_parts:
-        return "No actionable items were found in your request."
-
-    return "\n\n".join(response_parts)
+    return _build_final_response(finalize_items, reorder_items, cannot_items, sales_result_message, reorder_result_message)
 
 # initiatize orchestrator agent
 
