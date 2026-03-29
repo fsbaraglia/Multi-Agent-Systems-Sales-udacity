@@ -609,10 +609,9 @@ open_ai_key = os.getenv("OPENAI_API_KEY")
 provider = OpenAIProvider(
      openai_client=AsyncOpenAI(
          api_key=open_ai_key,
-         #base_url="https://openai.vocareum.com/v1",
      )
  )
-model = OpenAIModel("gpt-4o", provider=provider)
+model = OpenAIModel("gpt-4.1-mini", provider=provider)
 
 # Agents and Orchestrator initiatization
 orchestrator = Agent()
@@ -1203,10 +1202,10 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
             str: A final summarized outcome to the customer after processing the request through the agents.
     """
 
-    print("DEBUG_handle_customer_request FUNC call\n\n")
+    # print("DEBUG_handle_customer_request FUNC call\n\n")
 
-    print("customer_request=", customer_request)
-    print("\n\n")
+    # print("customer_request=", customer_request)
+    # print("\n\n")
 
     # Initialize all agent results to None so accesses never raise NameError
     inventory_result_message = None
@@ -1232,7 +1231,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
                 break
             except ValueError:
                 continue
-    print("customer_deadline=", customer_deadline)
+    # print("customer_deadline=", customer_deadline)
 
     #Step4: determinate request type
     is_inquiry = any(keyword in customer_request_lower for keyword in ["what do you have", "check", "stock", "inventory", "is there", "availability", "in stock"])
@@ -1247,11 +1246,12 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
     if quantities:
         quantities_mentioned = [int(q) for q in quantities]
     
-    print("is_inquiry", is_inquiry)
-    print("is_quote", is_quote)
-    print("is_purchase", is_purchase)
+    # print("is_inquiry", is_inquiry)
+    # print("is_quote", is_quote)
+    # print("is_purchase", is_purchase)
 
     #Step 5: extract exact item names and quantities from the customer request
+
     items_mentioned = []
     quantities_mentioned = []
     unresolved_items = []  # items extracted but not found in our catalog
@@ -1260,7 +1260,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
     # the separator space when no unit word is present (e.g. "200 balloons").
     # Also added \bfor\b as a lookahead terminator so "200 balloons for the parade"
     # stops at "balloons" and doesn't absorb the trailing phrase.
-    pair_pattern = r'(\d[\d,]*)(?:\s+(?:sheets?|units?|reams?|rolls?|boxes?))?\s+(?:of\s+)?([a-zA-Z][a-zA-Z0-9\s\(\)\-]+?)(?=\s*(?:,|\band\b|\bfor\b|\.|$))'
+    pair_pattern = r'(\d+(?:,\d+)*)(?:\s+(?:sheets?|units?|reams?|rolls?|boxes?))?\s+(?:of\s+)?([a-zA-Z0-9][a-zA-Z0-9\s\(\)\-\."]+?)(?=\s*(?:,|\band\b|\bfor\b|\bto\b|\bby\b|\bin\b|(?<!\d)\.|$))'
     pairs = re.findall(pair_pattern, customer_request_lower, re.IGNORECASE | re.MULTILINE)
 
     for qty_str, item_candidate in pairs:
@@ -1301,12 +1301,12 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
 
     inventory_details = []
     if inventory_result_message is not None:
-        print("inventory_result_message=", inventory_result_message.output)
+        # print("inventory_result_message=", inventory_result_message.output)
         inventory_json_match = re.search(r'inventory_details\s*:\s*(\[.*?\])', inventory_result_message.output, re.DOTALL)
         if inventory_json_match:
             try:
                 inventory_details = json.loads(inventory_json_match.group(1))
-                print("inventory_details=", json.dumps(inventory_details, indent=2))
+                # print("inventory_details=", json.dumps(inventory_details, indent=2))
             except json.JSONDecodeError as e:
                 print(f"Warning: could not parse inventory_details JSON: {e}")
         else:
@@ -1329,7 +1329,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
     insufficient_items = [i for i in inventory_details if i.get("status") == "Insufficient"]
 
     if insufficient_items and customer_deadline:
-        print("DEBUG_restock_check: found insufficient items, checking delivery feasibility")
+        # print("DEBUG_restock_check: found insufficient items, checking delivery feasibility")
         restock_candidates = []
 
         for item in insufficient_items:
@@ -1337,10 +1337,10 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
             qty_needed = int(item["qty_requested"] * 1.1)
             estimated_delivery_str = get_supplier_delivery_date(as_of_date, qty_needed)
             estimated_delivery = datetime.fromisoformat(estimated_delivery_str).date()
-            print(f"  {item_name}: delivery {estimated_delivery_str}, deadline {customer_deadline}")
+            # print(f"  {item_name}: delivery {estimated_delivery_str}, deadline {customer_deadline}")
 
             customer_delivery_date = estimated_delivery
-            print(f"  {item_name}: restock arrives {estimated_delivery_str}, customer delivery {customer_delivery_date}, deadline {customer_deadline}")
+            # print(f"  {item_name}: restock arrives {estimated_delivery_str}, customer delivery {customer_delivery_date}, deadline {customer_deadline}")
 
             if customer_delivery_date <= customer_deadline:
                 restock_candidates.append({
@@ -1355,7 +1355,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
         if restock_candidates:
             # Check cash balance once before any restock
             cash_balance = get_cash_balance(as_of_date)
-            print(f"DEBUG_restock_check: cash balance = ${cash_balance:.2f}")
+            # print(f"DEBUG_restock_check: cash balance = ${cash_balance:.2f}")
 
             affordable_candidates = []
             for c in restock_candidates:
@@ -1380,7 +1380,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
                     f"- item_name: {c['item_name']}, quantity: {c['qty_requested']}, unit_price: {c['unit_price']:.4f}, order_date: {as_of_date}"
                     for c in affordable_candidates
                 )
-                print("DEBUG_restock_order: placing restock orders via inventory agent")
+                # print("DEBUG_restock_order: placing restock orders via inventory agent")
                 await inventory_agent.run(
                     f"TASK TYPE: RESTOCK ORDER. Do NOT run proactive stock maintenance.\n"
                     f"Call place_stock_order once for each item below using the exact values provided.\n"
@@ -1401,11 +1401,11 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
                         item["estimated_delivery_date"] = candidate["customer_delivery_date"]
                         print(f"  Re-checked {item['item_name']}: new stock={new_stock}, status={item['status']}, customer delivery={candidate['customer_delivery_date']}")
 
-        print("inventory_details after restock=", json.dumps(inventory_details, indent=2))
+        # print("inventory_details after restock=", json.dumps(inventory_details, indent=2))
 
     #Step 8: get a quote from the quoting agent using exact DB item names
 
-    print("DEBUG_quote_agent_run FUNC call\n\n")
+    # print("DEBUG_quote_agent_run FUNC call\n\n")
     items_quantities = ", ".join(f"{q} x {i}" for i, q in zip(items_mentioned, quantities_mentioned))
 
     # Build delivery date overrides for items that were restocked in Step 7b
@@ -1446,14 +1446,14 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
     if quote_json_match:
         try:
             quote_details = json.loads(quote_json_match.group(1))
-            print("quote_details=", json.dumps(quote_details, indent=2))
+            # print("quote_details=", json.dumps(quote_details, indent=2))
         except json.JSONDecodeError as e:
             print(f"Warning: could not parse quote_details JSON: {e}")
     else:
         print("Warning: quote_details JSON block not found in quoting agent output.")
 
     #Step 10: use the business analysis agent to analyze the quote and decide the next action.
-    print("DEBUG_ba_analysis_agent_run FUNC call\n\n")
+    # print("DEBUG_ba_analysis_agent_run FUNC call\n\n")
     inventory_summary = json.dumps(inventory_details, indent=2) if inventory_details else "No inventory data available."
     business_analysis_agent_instructions = (
         f"Inventory status:\n{inventory_summary}\n\n"
@@ -1476,7 +1476,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
 
     business_advisor_result = await business_advisor_agent.run(business_analysis_agent_instructions)
     ba_analysis_result = business_advisor_result.output
-    print("ba_analysis_result=", ba_analysis_result)
+    # print("ba_analysis_result=", ba_analysis_result)
 
     #Step 11: Route each item to the appropriate agent based on BA decision
 
@@ -1490,15 +1490,15 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
     except json.JSONDecodeError:
         return "We apologize — we could not parse the business analysis. Please try again."
 
-    print("business_analysis_details=", business_analysis_details)
+    # print("business_analysis_details=", business_analysis_details)
 
     finalize_items = [i for i in business_analysis_details if i.get("action") == "FINALIZE_ORDER"]
     reorder_items  = [i for i in business_analysis_details if i.get("action") == "REORDER_STOCK"]
     cannot_items   = [i for i in business_analysis_details if i.get("action") == "CANNOT_FULFILL"]
 
-    print("DEBUG_finalize_items",finalize_items)
-    print("DEBUG_reorder_items",reorder_items)
-    print("DEBUG_cannot_items",cannot_items)
+    # print("DEBUG_finalize_items",finalize_items)
+    # print("DEBUG_reorder_items",reorder_items)
+    # print("DEBUG_cannot_items",cannot_items)
 
     #Step 11b: --- Sales agent: finalize confirmed orders ---
     if finalize_items:
@@ -1511,7 +1511,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
             f"Finalize the following confirmed orders as of {as_of_date}. "
             f"Call finalize_order once per item using the exact values below:\n{items_list}"
         )
-        print("sales_result=", sales_result_message.output)
+        # print("sales_result=", sales_result_message.output)
 
     #Step 11c: --- Inventory agent: place restock orders ---
     if reorder_items:
@@ -1525,7 +1525,7 @@ async def handle_customer_request(ctx: RunContext[OrchestratorDependencies], cus
             f"Call place_stock_order once for each item below using the exact values provided.\n"
             f"Date: {as_of_date}.\n{items_list}"
         )
-        print("reorder_result=", reorder_result_message.output)
+        # print("reorder_result=", reorder_result_message.output)
 
     #Step 12: --- Build final response ---
     response_parts = []
@@ -1554,57 +1554,6 @@ orchestrator = Agent(
     ],
     system_prompt=ORCHESTATOR_SYSTEM_PROMPT,
 )
-
-# @orchestrator.tool
-# def check_inventory(ctx: RunContext[OrchestratorDependencies], request: str) -> str:
-#     """Delegate an inventory-related question to the inventory agent."""
-#     result = inventory_agent.run_sync(request)
-#     return result.output
-
-# @orchestrator.tool
-# def get_quote(ctx: RunContext[OrchestratorDependencies], request: str) -> str:
-#     """Delegate a quoting request to the quoting agent."""
-#     result = quoting_agent.run_sync(request)
-#     return result.output
-
-# @orchestrator.tool
-# def place_order(ctx: RunContext[OrchestratorDependencies], request: str) -> str:
-#     """Delegate an order placement request to the sales agent."""
-#     result = sales_agent.run_sync(request)
-#     return result.output
-
-
-# def process_customer_request(customer_request: str, request_date: str) -> str:
-#     """Process a customer request through the multi-agent orchestration system."""
-#     prompt = f"Customer request: {customer_request}. Today's date: {request_date}."
-#     result = orchestrator.run_sync(prompt)
-#     return result.output
-        
-# Print Agent actions and reasoning in the console for better visibility during testing
-
-# def print_agent_observability(agent_name: str, activity: str, status: str):
-#     """
-#     Utility function to print agent activities and reasoning in a structured format for better observability during testing.
-
-#     Args:
-#         agent_name (str): The name of the agent performing the activity.
-#         activity (str): A description of the activity being performed.
-#         status (str): The current status or result of the activity.
-#     """
-#     status_emojis = {
-#         "elaborating": "🧠",
-#         "completed": "✅",
-#         "error": "❌",
-#     }
-#     emoji = status_emojis.get(status, "ℹ️")
-    
-#     sys.stdout.write(f"{emoji} [{agent_name}] {activity} - Status: {status}\n")
-#     sys.stdout.flush()
-#     time.sleep(0.4) # Simulate processing time for better readability
-
-# def print_agent_completion(agent_name: str, response: str):
-#     """Print agent message in a structured format to indicate completion of a task."""
-#     print(f"✅ [{agent_name}] Completed task with response:\n{response}\n")
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
 
@@ -1642,8 +1591,7 @@ def run_test_scenarios():
     print("Multi-Agent System ready ...\n")
 
     results = []
-    #for idx, row in quote_requests_sample.iterrows():
-    for idx, row in quote_requests_sample.head(3).iterrows():
+    for idx, row in quote_requests_sample.iterrows():
         request_date = row["request_date"].strftime("%Y-%m-%d")
 
         print(f"\n=== Request {idx+1} ===")
